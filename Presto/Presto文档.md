@@ -400,7 +400,360 @@ hive.config.resources=/etc/hadoop/conf/core-site.xml,/etc/hadoop/conf/hdfs-site.
 
 （3）Configuration Properties
 
-表头1|表头2|表头3
+Property Name|Description|Example
 :----|:-----:|-----:
-左对齐|居中对齐|右对齐
+hive.metastore.uri|The URI of the Hive Metastore to connect to using the Thrift protocol. This property is required.|thrift://192.0.2.3:9083
+hive.config.resources|An optional comma-separated list of HDFS configuration files. These files must exist on the machines running Presto. Only specify this if absolutely necessary to access HDFS.|/etc/hdfs-site.xml
+hive.storage-format|The default file format used when creating new tables|RCBINARY
+hive.force-local-scheduling|Force splits to be scheduled on the same node as the Hadoop DataNode process serving the split data. This is useful for installations where Presto is collocated with every DataNode.|true
 
+
+4）presto连接hive schema，注意presto不能进行垮库join操作，测试结果如下：
+
+```
+$ ./presto --server localhost:8080 --catalog hive --schema chavin
+presto:chavin> select * from emp;
+
+```
+
+empno | ename | job | mgr | hiredate | sal | comm | deptno
+-------+--------+-----------+------+------------+--------+--------+--------
+7369 | SMITH | CLERK | 7902 | 1980/12/17 | 800.0 | NULL | 20
+7499 | ALLEN | SALESMAN | 7698 | 1981/2/20 | 1600.0 | 300.0 | 30
+7521 | WARD | SALESMAN | 7698 | 1981/2/22 | 1250.0 | 500.0 | 30
+7566 | JONES | MANAGER | 7839 | 1981/4/2 | 2975.0 | NULL | 20
+7654 | MARTIN | SALESMAN | 7698 | 1981/9/28 | 1250.0 | 1400.0 | 30
+7698 | BLAKE | MANAGER | 7839 | 1981/5/1 | 2850.0 | NULL | 30
+7782 | CLARK | MANAGER | 7839 | 1981/6/9 | 2450.0 | NULL | 10
+7788 | SCOTT | ANALYST | 7566 | 1987/4/19 | 3000.0 | NULL | 20
+7839 | KING | PRESIDENT | NULL | 1981/11/17 | 5000.0 | NULL | 10
+7844 | TURNER | SALESMAN | 7698 | 1981/9/8 | 1500.0 | 0.0 | 30
+7876 | ADAMS | CLERK | 7788 | 1987/5/23 | 1100.0 | NULL | 20
+7900 | JAMES | CLERK | 7698 | 1981/12/3 | 950.0 | NULL | 30
+7902 | FORD | ANALYST | 7566 | 1981/12/3 | 3000.0 | NULL | 20
+7934 | MILLER | CLERK | 7782 | 1982/1/23 | 1300.0 | NULL | 10
+(14 rows)
+Query 20170711_081802_00002_ydh8n, FINISHED, 1 node
+Splits: 17 total, 17 done (100.00%)
+0:05 [14 rows, 657B] [2 rows/s, 130B/s]
+presto:chavin>
+
+
+# 3.Presto优化
+
+### 3.1 数据存储
+
+1）合理设置分区
+与Hive类似，Presto会根据元信息读取分区数据，合理的分区能减少Presto数据读取量，提升查询性能。
+
+2）使用列式存储
+Presto对ORC文件读取做了特定优化，因此在Hive中创建Presto使用的表时，建议采用ORC格式存储。相对于Parquet，Presto对ORC支持更好。
+
+3）使用压缩
+数据压缩可以减少节点间数据传输对IO带宽压力，对于即席查询需要快速解压，建议采用Snappy压缩。
+
+4）预先排序
+对于已经排序的数据，在查询的数据过滤阶段，ORC格式支持跳过读取不必要的数据。比如对于经常需要过滤的字段可以预先排序。
+
+```
+INSERT INTO table nation_orc partition(p) SELECT * FROM nation SORT BY n_name;
+```
+
+如果需要过滤n_name字段，则性能将提升。
+```
+SELECT count(*) FROM nation_orc WHERE n_name=’AUSTRALIA’; 
+```
+
+
+### 3.2 查询SQL优化
+
+1）只选择使用必要的字段 
+由于采用列式存储，选择需要的字段可加快字段的读取、减少数据量。避免采用*读取所有字段。
+
+```
+[GOOD]: SELECT time,user,host FROM tbl
+[BAD]:  SELECT * FROM tbl
+
+```
+
+2）过滤条件必须加上分区字段 
+对于有分区的表，where语句中优先使用分区字段进行过滤。acct_day是分区字段，visit_time是具体访问时间。
+```
+[GOOD]: SELECT time,user,host FROM tbl where acct_day=20171101
+[BAD]:  SELECT * FROM tbl where visit_time=20171101
+
+```
+
+3）Group By语句优化 
+合理安排Group by语句中字段顺序对性能有一定提升。将Group By语句中字段按照每个字段distinct数据多少进行降序排列。
+```
+[GOOD]: SELECT GROUP BY uid, gender
+[BAD]:  SELECT GROUP BY gender, uid
+
+```
+
+4）Order by时使用Limit 
+Order by需要扫描数据到单个worker节点进行排序，导致单个worker需要大量内存。如果是查询Top N或者Bottom N，使用limit可减少排序计算和内存压力。
+
+```
+[GOOD]: SELECT * FROM tbl ORDER BY time LIMIT 100
+[BAD]:  SELECT * FROM tbl ORDER BY time
+
+```
+
+5）使用近似聚合函数 
+Presto有一些近似聚合函数，对于允许有少量误差的查询场景，使用这些函数对查询性能有大幅提升。比如使用approx_distinct() 函数比Count(distinct x)有大概2.3%的误差。
+```
+SELECT approx_distinct(user_id) FROM access
+```
+
+6）用regexp_like代替多个like语句 
+Presto查询优化器没有对多个like语句进行优化，使用regexp_like对性能有较大提升
+
+```
+[GOOD]
+SELECT
+  ...
+FROM
+  access
+WHERE
+  regexp_like(method, 'GET|POST|PUT|DELETE')
+
+[BAD]
+SELECT
+  ...
+FROM
+  access
+WHERE
+  method LIKE '%GET%' OR
+  method LIKE '%POST%' OR
+  method LIKE '%PUT%' OR
+  method LIKE '%DELETE%'
+
+```
+
+7）使用Join语句时将大表放在左边 
+Presto中join的默认算法是broadcast join，即将join左边的表分割到多个worker，然后将join右边的表数据整个复制一份发送到每个worker进行计算。如果右边的表数据量太大，则可能会报内存溢出错误。
+
+```
+[GOOD] SELECT ... FROM large_table l join small_table s on l.id = s.id
+[BAD] SELECT ... FROM small_table s join large_table l on l.id = s.id
+
+```
+
+8）使用Rank函数代替row_number函数来获取Top N 
+在进行一些分组排序场景时，使用rank函数性能更好。
+```
+[GOOD]
+SELECT checksum(rnk)
+FROM (
+  SELECT rank() OVER (PARTITION BY l_orderkey, l_partkey ORDER BY l_shipdate DESC) AS rnk
+  FROM lineitem
+) t
+WHERE rnk = 1
+
+[BAD]
+SELECT checksum(rnk)
+FROM (
+  SELECT row_number() OVER (PARTITION BY l_orderkey, l_partkey ORDER BY l_shipdate DESC) AS rnk
+  FROM lineitem
+) t
+WHERE rnk = 1
+
+```
+
+### 3.3 无缝替换Hive表
+
+如果之前的hive表没有用到ORC和snappy，那么怎么无缝替换而不影响线上的应用： 
+比如如下一个hive表：
+
+```
+CREATE TABLE bdc_dm.res_category(
+channel_id1 int comment '1级渠道id',
+province string COMMENT '省',
+city string comment '市', 
+uv int comment 'uv'
+)
+comment 'example'
+partitioned by (landing_date int COMMENT '日期:yyyymmdd')
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' COLLECTION ITEMS TERMINATED BY ',' MAP KEYS TERMINATED BY ':' LINES TERMINATED BY '\n';
+
+```
+
+建立对应的orc表
+
+```
+CREATE TABLE bdc_dm.res_category_orc(
+channel_id1 int comment '1级渠道id',
+province string COMMENT '省',
+city string comment '市', 
+uv int comment 'uv'
+)
+comment 'example'
+partitioned by (landing_date int COMMENT '日期:yyyymmdd')
+row format delimited fields terminated by '\t'
+stored as orc 
+TBLPROPERTIES ("orc.compress"="SNAPPY");
+
+```
+
+先将数据灌入orc表，然后更换表名
+
+```
+insert overwrite table bdc_dm.res_category_orc partition(landing_date)
+select * from bdc_dm.res_category where landing_date >= 20171001;
+
+ALTER TABLE bdc_dm.res_category RENAME TO bdc_dm.res_category_tmp;
+ALTER TABLE bdc_dm.res_category_orc RENAME TO bdc_dm.res_category;
+
+```
+
+其中res_category_tmp是一个备份表，若线上运行一段时间后没有出现问题，则可以删除该表。
+
+### 3.4 注意事项
+
+> ORC和Parquet都支持列式存储，但是ORC对Presto支持更好（Parquet对Impala支持更好）
+  对于列式存储而言，存储文件为二进制的，对于经常增删字段的表，建议不要使用列式存储（修改文件元数据代价大）。对比数据仓库，dwd层建议不要使用ORC，而dm层则建议使用。
+
+# 4.Presto上使用SQL遇到的坑
+
+<https://segmentfault.com/a/1190000013120454?utm_source=tag-newest>
+
+### 4.1 如何加快在Presto上的数据统计
+
+很多的时候，在Presto上对数据库跨库查询，例如Mysql数据库。这个时候Presto的做法是从MySQL数据库端拉取最基本的数据，然后再去做进一步的处理，例如统计等聚合操作。
+
+举个例子：
+
+```
+SELECT count(id) FROM table_1 WHERE condition=1;
+```
+
+上面的SQL语句会分为3个步骤进行：
+
+（1）Presto发起到Mysql数据库进行查询
+
+```
+SELECT id FROM table_1 WHERE condition=1;
+```
+
+（2）对结果进行count计算
+
+（3）返回结果
+所以说，对于Presto来说，其跨库查询的瓶颈是在数据拉取这个步骤。若要提高数据统计的速度，可考虑把Mysql中相关的数据表定期转移到HDFS中，并转存为高效的列式存储格式ORC。
+
+所以定时归档是一个很好的选择，这里还要注意，在归档的时候我们要选择一个归档字段，如果是按日归档，我们可以用日期作为这个字段的值，采用yyyyMMdd的形式，例如20180123.
+
+一般创建归档数据库的SQL语句如下：
+
+```
+CREATE TABLE IF NOT EXISTS table_1 (
+id INTEGER,
+........
+partition_date INTEGER
+)WITH ( format = 'ORC', partitioned_by = ARRAY['partition_date'] );
+
+```
+
+查看创建的库结构：
+
+```
+SHOW CREATE TABLE table_1; /*Only Presto*/
+```
+
+带有分区的表创建完成之后，每天只要更新分区字段partition_date就可以了，聪明的Presto就能将数据放置到规划好的分区了。
+
+如果要查看一个数据表的分区字段是什么，可以下面的语句：
+
+```
+SHOW PARTITIONS FROM table_1 /*Only Presto*/
+```
+### 4.2 查询条件中尽量带上分区字段进行过滤
+
+如果数据被规当到HDFS中，并带有分区字段。
+
+在每次查询归档表的时候，要带上分区字段作为过滤条件，这样可以加快查询速度。
+
+因为有了分区字段作为查询条件，就能帮助Presto避免全区扫描，减少Presto需要扫描的HDFS的文件数。
+
+### 4.3 多多使用WITH语句
+
+使用Presto分析统计数据时，可考虑把多次查询合并为一次查询，用Presto提供的子查询完成。
+这点和我们熟知的MySQL的使用不是很一样。
+例如：
+
+```
+WITH subquery_1 AS (
+    SELECT a1, a2, a3 
+    FROM Table_1 
+    WHERE a3 between 20180101 and 20180131
+),               /*子查询subquery_1,注意：多个子查询需要用逗号分隔*/
+subquery_2 AS (
+    SELECT b1, b2, b3
+    FROM Table_2
+    WHERE b3 between 20180101 and 20180131
+)                /*最后一个子查询后不要带逗号，不然会报错。*/        
+SELECT 
+    subquery_1.a1, subquery_1.a2, 
+    subquery_2.b1, subquery_2.b2
+FROM subquery_1
+    JOIN subquery_2
+    ON subquery_1.a3 = subquery_2.b3; 
+
+```
+
+### 4.4 利用子查询，减少读表的次数，尤其是大数据量的表
+
+具体做法是，将使用频繁的表作为一个子查询抽离出来，避免多次read。
+
+
+### 4.5 只查询需要的字段
+
+一定要避免在查询中使用 SELECT *这样的语句，换位思考，如果让你去查询数据是不是告诉你的越具体，工作效率越高呢。
+
+对于我们的数据库而言也是这样，任务越明确，工作效率越高。
+
+对于要查询全部字段的需求也是这样，没有偷懒的捷径，把它们都写出来。
+
+### 4.6 Join查询优化
+
+Join左边尽量放小数据量的表，而且最好是重复关联键少的表
+
+### 4.7 字段名引用
+
+Presto中的字段名引用使用双引号分割，这个要区别于MySQL的反引号`。
+当然，你可以不加这个双引号。
+
+
+### 4.8 时间函数
+
+对于timestamp，需要进行比较的时候，需要添加timestamp关键字，而MySQL中对timestamp可以直接进行比较。
+
+```
+/*MySQL的写法*/
+SELECT t FROM a WHERE t > '2017-01-01 00:00:00'; 
+
+/*Presto中的写法*/
+SELECT t FROM a WHERE t > timestamp '2017-01-01 00:00:00';
+
+```
+
+### 4.9  MD5函数的使用
+
+Presto中MD5函数传入的是binary类型，返回的也是binary类型，要对字符串进行MD5操作时，需要转换.
+
+```
+SELECT to_hex(md5(to_utf8('1212')));
+```
+
+### 4.10 不支持INSERT OVERWRITE语法
+
+Presto中不支持insert overwrite语法，只能先delete，然后insert into。
+
+### 4.11 ORC格式
+
+Presto中对ORC文件格式进行了针对性优化，但在impala中目前不支持ORC格式的表，hive中支持ORC格式的表，所以想用列式存储的时候可以优先考虑ORC格式。
+
+### 4.12 PARQUET格式
+
+Presto目前支持parquet格式，支持查询，但不支持insert。
